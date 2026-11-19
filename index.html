@@ -202,6 +202,22 @@
             transform: translateY(-3px);
         }
         
+        .btn-stop {
+            background-color: #f44336;
+            color: white;
+        }
+        
+        .btn-stop:hover {
+            background-color: #d32f2f;
+            transform: translateY(-3px);
+        }
+        
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: wait;
+            transform: none !important;
+        }
+        
         .instructions {
             background-color: #fff3e0;
             border-radius: 15px;
@@ -256,6 +272,15 @@
         
         @keyframes growTree {
             to { transform: scale(1); }
+        }
+        
+        /* 枯萎消失时只影响这一棵树，不重排其他树 */
+        .tree-container.wither {
+            animation: witherOut 0.4s ease forwards;
+        }
+        
+        @keyframes witherOut {
+            to { transform: scale(0) rotate(-8deg); opacity: 0; }
         }
         
         /* 树苗样式 */
@@ -639,7 +664,7 @@
                 <div class="db-control">
                     <label class="db-label">目标分贝值（达到此分贝持续5秒可种树）：</label>
                     <div class="db-input">
-                        <input type="range" min="10" max="60" value="25" class="db-slider" id="targetDb">
+                        <input type="range" min="10" max="100" value="25" class="db-slider" id="targetDb">
                         <div class="db-value" id="targetDbValue">25</div>
                     </div>
                 </div>
@@ -647,7 +672,7 @@
                 <div class="db-control">
                     <label class="db-label">消失分贝值（低于此分贝持续5秒树会消失）：</label>
                     <div class="db-input">
-                        <input type="range" min="5" max="30" value="15" class="db-slider" id="disappearDb">
+                        <input type="range" min="5" max="95" value="15" class="db-slider" id="disappearDb">
                         <div class="db-value" id="disappearDbValue">15</div>
                     </div>
                 </div>
@@ -657,7 +682,7 @@
                     <div class="current-db" id="currentDb">--</div>
                     <p class="db-status" id="dbStatus">
                         <span class="mic-status" id="micStatus"></span>
-                        请允许麦克风访问并点击开始监测
+                        <span id="dbStatusText">请允许麦克风访问并点击开始监测</span>
                     </p>
                     <p class="timer-display" id="timerDisplay">持续达标时间：0秒</p>
                 </div>
@@ -673,7 +698,7 @@
                 <div class="instructions">
                     <h3><i class="fas fa-info-circle"></i> 使用说明</h3>
                     <ul>
-                        <li>设置目标分贝值（建议25-35分贝）</li>
+                        <li>设置目标分贝值（建议按平时朗读的读数略低一点）</li>
                         <li>点击"开始监测朗读声音"按钮并允许麦克风访问</li>
                         <li>大声朗读，使分贝值达到目标并保持5秒钟</li>
                         <li>每成功一次，花园中就会长出一棵小树苗</li>
@@ -727,454 +752,555 @@
     <div class="notification" id="notification"></div>
 
     <script>
-        // 全局变量
-        let isMonitoring = false;
-        let audioContext;
-        let microphone;
-        let analyser;
-        let dataArray;
-        let targetDb = 25;
-        let disappearDb = 15;
-        let currentDb = 0;
-        let successTimer = 0;
-        let disappearTimer = 0;
-        let successTimerInterval;
-        let disappearTimerInterval;
-        let trees = [];
-        let seedlings = 0;
-        let smallTrees = 0;
-        let largeTrees = 0;
-        
-        // DOM元素
-        const targetDbSlider = document.getElementById('targetDb');
-        const targetDbValue = document.getElementById('targetDbValue');
-        const disappearDbSlider = document.getElementById('disappearDb');
-        const disappearDbValue = document.getElementById('disappearDbValue');
-        const currentDbDisplay = document.getElementById('currentDb');
-        const dbStatus = document.getElementById('dbStatus');
-        const timerDisplay = document.getElementById('timerDisplay');
-        const startBtn = document.getElementById('startBtn');
-        const resetBtn = document.getElementById('resetBtn');
-        const garden = document.getElementById('garden');
-        const emptyGardenMessage = document.getElementById('emptyGardenMessage');
-        const notification = document.getElementById('notification');
-        const seedlingCount = document.getElementById('seedlingCount');
-        const smallTreeCount = document.getElementById('smallTreeCount');
-        const largeTreeCount = document.getElementById('largeTreeCount');
-        const totalTrees = document.getElementById('totalTrees');
-        const micStatus = document.getElementById('micStatus');
-        
-        // 初始化事件监听
-        function initEventListeners() {
-            targetDbSlider.addEventListener('input', function() {
-                targetDb = parseInt(this.value);
-                targetDbValue.textContent = targetDb;
-            });
-            
-            disappearDbSlider.addEventListener('input', function() {
-                disappearDb = parseInt(this.value);
-                disappearDbValue.textContent = disappearDb;
-            });
-            
-            startBtn.addEventListener('click', toggleMonitoring);
-            resetBtn.addEventListener('click', resetGarden);
+  (function () {
+    'use strict';
+
+    /* ============================================================
+     * 常量
+     * ============================================================ */
+    const HOLD_MS = 5000;      // 达标 / 安静 需要持续的时间
+    const SAMPLE_MS = 50;      // 采样间隔（配合 fftSize 让采样覆盖大部分时间）
+    const MAX_DT = 1000;       // 单次最多累计 1 秒，防止后台恢复后一次性结算
+    const MIN_GAP = 5;         // 目标值与消失值之间至少留出的差值
+    const DBFS_OFFSET = 62;    // -62 dBFS 视为完全安静 → 显示 0
+    const DBFS_SCALE = 2.6;    // dBFS → 显示刻度
+    const FFT_SIZE = 2048;     // 约 43ms 窗口，减少"只听到一小段"导致的读数偏低
+
+    /* ============================================================
+     * 状态
+     * ============================================================ */
+    let monitoring = false;    // 是否正在监测
+    let starting = false;      // 是否正在申请麦克风（防重入）
+    let stream = null;
+    let audioCtx = null;
+    let analyser = null;
+    let timeBuf = null;
+    let sampleTimer = null;
+    let rafId = 0;
+
+    let level = 0;             // 平滑后的音量 0~100
+    let holdMs = 0;            // 连续达标时长
+    let quietMs = 0;           // 连续安静时长
+    let lastTick = 0;
+
+    let targetDb = 25;
+    let disappearDb = 15;
+
+    const trees = [];          // { type: 'seedling' | 'small' | 'large', el }
+
+    /* ============================================================
+     * DOM
+     * ============================================================ */
+    const targetDbSlider = document.getElementById('targetDb');
+    const targetDbValue = document.getElementById('targetDbValue');
+    const disappearDbSlider = document.getElementById('disappearDb');
+    const disappearDbValue = document.getElementById('disappearDbValue');
+    const currentDbDisplay = document.getElementById('currentDb');
+    const dbStatus = document.getElementById('dbStatus');
+    const dbStatusText = document.getElementById('dbStatusText');
+    const micStatus = document.getElementById('micStatus');
+    const timerDisplay = document.getElementById('timerDisplay');
+    const startBtn = document.getElementById('startBtn');
+    const resetBtn = document.getElementById('resetBtn');
+    const garden = document.getElementById('garden');
+    const emptyGardenMessage = document.getElementById('emptyGardenMessage');
+    const notification = document.getElementById('notification');
+    const seedlingCount = document.getElementById('seedlingCount');
+    const smallTreeCount = document.getElementById('smallTreeCount');
+    const largeTreeCount = document.getElementById('largeTreeCount');
+    const totalTrees = document.getElementById('totalTrees');
+
+    const treesContainer = document.createElement('div');
+    treesContainer.id = 'trees-container';
+    Object.assign(treesContainer.style, {
+      display: 'flex',
+      flexWrap: 'wrap',
+      justifyContent: 'center',
+      alignItems: 'flex-end',
+      width: '100%',
+      gap: '40px',
+      position: 'relative',
+      zIndex: '5'
+    });
+    garden.appendChild(treesContainer);
+
+    /* ============================================================
+     * 阈值
+     * ============================================================ */
+    function clampThresholds(changed) {
+      // 目标值必须比消失值大，否则两个计时器会同时触发
+      if (targetDb - disappearDb < MIN_GAP) {
+        if (changed === 'target') {
+          disappearDb = Math.max(5, targetDb - MIN_GAP);
+        } else {
+          targetDb = Math.min(100, disappearDb + MIN_GAP);
         }
-        
-        // 切换监测状态
-        function toggleMonitoring() {
-            if (!isMonitoring) {
-                startMonitoring();
-            } else {
-                stopMonitoring();
-            }
+      }
+      targetDbSlider.value = targetDb;
+      targetDbValue.textContent = targetDb;
+      disappearDbSlider.value = disappearDb;
+      disappearDbValue.textContent = disappearDb;
+      // 阈值变化后重新计时，避免"改完立刻结算"
+      holdMs = 0;
+      quietMs = 0;
+      saveSettings();
+    }
+
+    /* ============================================================
+     * 设置持久化（同一台设备下次打开仍是调好的参数）
+     * ============================================================ */
+    const STORAGE_KEY = 'reading-garden-settings';
+
+    function saveSettings() {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({
+          target: targetDb,
+          disappear: disappearDb
+        }));
+      } catch (e) { /* 隐私模式等场景忽略 */ }
+    }
+
+    function loadSettings() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return;
+        const o = JSON.parse(raw);
+        if (typeof o.target === 'number' && o.target >= 10 && o.target <= 100) targetDb = o.target;
+        if (typeof o.disappear === 'number' && o.disappear >= 5 && o.disappear <= 95) disappearDb = o.disappear;
+      } catch (e) { /* 忽略损坏的存储 */ }
+    }
+
+    /* ============================================================
+     * 状态文案
+     * ============================================================ */
+    function setStatus(text, color) {
+      dbStatusText.textContent = text;
+      dbStatus.style.color = color;
+    }
+
+    function updateStatusText() {
+      if (level >= targetDb) {
+        setStatus('声音达标！继续保持！', '#4caf50');
+      } else if (level < disappearDb) {
+        setStatus('声音太小了，请大声朗读！', '#f44336');
+      } else {
+        setStatus('声音适中，再大声一点更棒！', '#ff9800');
+      }
+    }
+
+    /* ============================================================
+     * 麦克风生命周期
+     * ============================================================ */
+    async function startMonitoring() {
+      if (monitoring || starting) return;   // 关键：防重入
+      starting = true;
+      startBtn.disabled = true;
+
+      try {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          const e = new Error('insecure-context');
+          e.name = 'InsecureContextError';
+          throw e;
         }
-        
-        // 开始监测
-        async function startMonitoring() {
-            try {
-                const stream = await navigator.mediaDevices.getUserMedia({ 
-                    audio: {
-                        echoCancellation: true,
-                        noiseSuppression: true,
-                        autoGainControl: false
-                    } 
-                });
-                
-                audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                microphone = audioContext.createMediaStreamSource(stream);
-                analyser = audioContext.createAnalyser();
-                analyser.fftSize = 512;
-                analyser.smoothingTimeConstant = 0.8;
-                
-                microphone.connect(analyser);
-                
-                dataArray = new Uint8Array(analyser.frequencyBinCount);
-                
-                isMonitoring = true;
-                startBtn.innerHTML = '<i class="fas fa-microphone-slash"></i> 停止监测';
-                startBtn.classList.add('btn-reset');
-                startBtn.classList.remove('btn-start');
-                dbStatus.textContent = '正在监测朗读声音...';
-                dbStatus.style.color = '#388e3c';
-                micStatus.classList.add('active');
-                
-                // 开始定时检查分贝
-                successTimerInterval = setInterval(updateSuccessTimer, 1000);
-                disappearTimerInterval = setInterval(updateDisappearTimer, 1000);
-                updateDbDisplay();
-                
-                showNotification('已开始监测朗读声音，请大声朗读吧！', 'success');
-            } catch (err) {
-                console.error('无法访问麦克风:', err);
-                showNotification('无法访问麦克风，请检查权限设置', 'error');
-                dbStatus.textContent = '麦克风访问被拒绝，请检查权限';
-                dbStatus.style.color = '#f44336';
-            }
-        }
-        
-        // 停止监测
-        function stopMonitoring() {
-            if (audioContext) {
-                audioContext.close();
-            }
-            
-            isMonitoring = false;
-            startBtn.innerHTML = '<i class="fas fa-microphone"></i> 开始监测朗读声音';
-            startBtn.classList.add('btn-start');
-            startBtn.classList.remove('btn-reset');
-            dbStatus.textContent = '监测已停止';
-            dbStatus.style.color = '#546e7a';
-            currentDbDisplay.textContent = '--';
-            timerDisplay.textContent = '持续达标时间：0秒';
-            micStatus.classList.remove('active');
-            
-            clearInterval(successTimerInterval);
-            clearInterval(disappearTimerInterval);
-            successTimer = 0;
-            disappearTimer = 0;
-            
-            showNotification('已停止声音监测', 'warning');
-        }
-        
-        // 更新分贝显示
-        function updateDbDisplay() {
-            if (!isMonitoring || !analyser) return;
-            
-            analyser.getByteFrequencyData(dataArray);
-            
-            // 计算平均分贝值
-            let sum = 0;
-            for (let i = 0; i < dataArray.length; i++) {
-                sum += dataArray[i];
-            }
-            let average = sum / dataArray.length;
-            
-            // 将0-255的值转换为0-100的分贝近似值
-            // 增加一些随机性使显示更自然
-            currentDb = Math.floor(average / 2.55);
-            
-            // 模拟真实环境：安静时10-15分贝，朗读时25-40分贝
-            if (currentDb < 10) currentDb = Math.floor(Math.random() * 5) + 10;
-            
-            currentDbDisplay.textContent = currentDb;
-            
-            // 更新分贝状态
-            if (currentDb >= targetDb) {
-                dbStatus.innerHTML = '<span class="mic-status active"></span>声音达标！继续保持！';
-                dbStatus.style.color = '#4caf50';
-            } else if (currentDb < disappearDb) {
-                dbStatus.innerHTML = '<span class="mic-status active"></span>声音太小了，请大声朗读！';
-                dbStatus.style.color = '#f44336';
-            } else {
-                dbStatus.innerHTML = '<span class="mic-status active"></span>声音适中，再大声一点更棒！';
-                dbStatus.style.color = '#ff9800';
-            }
-            
-            // 继续更新
-            requestAnimationFrame(updateDbDisplay);
-        }
-        
-        // 更新成功计时器
-        function updateSuccessTimer() {
-            if (currentDb >= targetDb) {
-                successTimer++;
-                timerDisplay.textContent = `持续达标时间：${successTimer}秒`;
-                
-                if (successTimer >= 5) {
-                    addTree();
-                    successTimer = 0;
-                    timerDisplay.textContent = '持续达标时间：0秒';
-                }
-            } else {
-                successTimer = 0;
-                timerDisplay.textContent = '持续达标时间：0秒';
-            }
-        }
-        
-        // 更新消失计时器
-        function updateDisappearTimer() {
-            if (currentDb < disappearDb) {
-                disappearTimer++;
-                
-                if (disappearTimer >= 5) {
-                    removeTree();
-                    disappearTimer = 0;
-                }
-            } else {
-                disappearTimer = 0;
-            }
-        }
-        
-        // 添加树木
-        function addTree() {
-            // 添加树苗
-            trees.push('seedling');
-            seedlings++;
-            
-            // 检查是否应该升级树木
-            checkTreeUpgrades();
-            
-            // 更新花园显示
-            updateGarden();
-            updateTreeCounts();
-            
-            showNotification(`太棒了！你种下了一棵小树苗！`, 'success');
-        }
-        
-        // 移除树木
-        function removeTree() {
-            if (trees.length === 0) return;
-            
-            // 从最高级的树木开始移除
-            if (largeTrees > 0) {
-                // 移除一棵大树，将其分解为5棵小树
-                largeTrees--;
-                smallTrees += 5;
-                // 从树木数组中移除对应的树
-                for (let i = trees.length - 1; i >= 0; i--) {
-                    if (trees[i] === 'large') {
-                        trees.splice(i, 1);
-                        // 添加5棵小树
-                        for (let j = 0; j < 5; j++) {
-                            trees.push('small');
-                        }
-                        break;
-                    }
-                }
-            } else if (smallTrees > 0) {
-                // 移除一棵小树，将其分解为5棵树苗
-                smallTrees--;
-                seedlings += 5;
-                // 从树木数组中移除对应的树
-                for (let i = trees.length - 1; i >= 0; i--) {
-                    if (trees[i] === 'small') {
-                        trees.splice(i, 1);
-                        // 添加5棵树苗
-                        for (let j = 0; j < 5; j++) {
-                            trees.push('seedling');
-                        }
-                        break;
-                    }
-                }
-            } else if (seedlings > 0) {
-                // 移除一棵树苗
-                seedlings--;
-                // 从树木数组中移除一棵树苗
-                for (let i = trees.length - 1; i >= 0; i--) {
-                    if (trees[i] === 'seedling') {
-                        trees.splice(i, 1);
-                        break;
-                    }
-                }
-            }
-            
-            // 重新检查升级
-            checkTreeUpgrades();
-            
-            // 更新花园显示
-            updateGarden();
-            updateTreeCounts();
-            
-            showNotification('声音太小了，一棵树消失了！请大声朗读！', 'error');
-        }
-        
-        // 检查树木升级
-        function checkTreeUpgrades() {
-            // 检查树苗是否够5棵，升级为小树
-            while (seedlings >= 5) {
-                seedlings -= 5;
-                smallTrees++;
-                
-                // 从树木数组中移除5棵树苗，添加1棵小树
-                let removed = 0;
-                for (let i = trees.length - 1; i >= 0 && removed < 5; i--) {
-                    if (trees[i] === 'seedling') {
-                        trees.splice(i, 1);
-                        removed++;
-                    }
-                }
-                trees.push('small');
-                
-                showNotification('恭喜！5棵小树苗合成了一棵小树！', 'success');
-            }
-            
-            // 检查小树是否够5棵，升级为大树
-            while (smallTrees >= 5) {
-                smallTrees -= 5;
-                largeTrees++;
-                
-                // 从树木数组中移除5棵小树，添加1棵大树
-                let removed = 0;
-                for (let i = trees.length - 1; i >= 0 && removed < 5; i--) {
-                    if (trees[i] === 'small') {
-                        trees.splice(i, 1);
-                        removed++;
-                    }
-                }
-                trees.push('large');
-                
-                showNotification('太棒了！5棵小树合成了一棵大树！', 'success');
-            }
-        }
-        
-        // 更新花园显示
-        function updateGarden() {
-            // 创建一个新的容器来存放树木
-            const treesContainer = document.createElement('div');
-            treesContainer.id = 'trees-container';
-            treesContainer.style.display = 'flex';
-            treesContainer.style.flexWrap = 'wrap';
-            treesContainer.style.justifyContent = 'center';
-            treesContainer.style.alignItems = 'flex-end';
-            treesContainer.style.width = '100%';
-            treesContainer.style.gap = '40px';
-            treesContainer.style.position = 'relative';
-            treesContainer.style.zIndex = '5';
-            
-            if (trees.length === 0) {
-                emptyGardenMessage.style.display = 'block';
-                // 移除现有的树木容器
-                const existingContainer = document.getElementById('trees-container');
-                if (existingContainer) {
-                    existingContainer.remove();
-                }
-                return;
-            }
-            
-            emptyGardenMessage.style.display = 'none';
-            
-            // 显示所有树木
-            trees.forEach((treeType, index) => {
-                const treeContainer = document.createElement('div');
-                treeContainer.className = 'tree-container';
-                
-                // 创建树木
-                const treeElement = document.createElement('div');
-                treeElement.className = `tree tree-${treeType}`;
-                
-                // 根据树木类型添加不同的元素
-                if (treeType === 'seedling') {
-                    treeElement.innerHTML = `
-                        <div class="trunk"></div>
-                        <div class="leaf"></div>
-                    `;
-                } else if (treeType === 'small') {
-                    treeElement.innerHTML = `
-                        <div class="trunk"></div>
-                        <div class="leaf-1"></div>
-                        <div class="leaf-2"></div>
-                        <div class="leaf-3"></div>
-                    `;
-                } else if (treeType === 'large') {
-                    treeElement.innerHTML = `
-                        <div class="trunk"></div>
-                        <div class="leaf-1"></div>
-                        <div class="leaf-2"></div>
-                        <div class="leaf-3"></div>
-                        <div class="leaf-4"></div>
-                    `;
-                }
-                
-                const treeLabel = document.createElement('div');
-                treeLabel.className = 'tree-label';
-                
-                if (treeType === 'seedling') {
-                    treeLabel.textContent = '树苗';
-                } else if (treeType === 'small') {
-                    treeLabel.textContent = '小树';
-                } else {
-                    treeLabel.textContent = '大树';
-                }
-                
-                treeContainer.appendChild(treeElement);
-                treeContainer.appendChild(treeLabel);
-                treesContainer.appendChild(treeContainer);
-            });
-            
-            // 移除现有的树木容器
-            const existingContainer = document.getElementById('trees-container');
-            if (existingContainer) {
-                existingContainer.remove();
-            }
-            
-            // 添加到花园中（在草地的上方）
-            garden.appendChild(treesContainer);
-        }
-        
-        // 更新树木计数
-        function updateTreeCounts() {
-            seedlingCount.textContent = seedlings;
-            smallTreeCount.textContent = smallTrees;
-            largeTreeCount.textContent = largeTrees;
-            totalTrees.textContent = seedlings + smallTrees + largeTrees;
-        }
-        
-        // 重置花园
-        function resetGarden() {
-            trees = [];
-            seedlings = 0;
-            smallTrees = 0;
-            largeTrees = 0;
-            updateGarden();
-            updateTreeCounts();
-            showNotification('花园已重置，重新开始朗读吧！', 'warning');
-        }
-        
-        // 显示通知
-        function showNotification(message, type) {
-            notification.textContent = message;
-            notification.className = `notification ${type} show`;
-            
-            setTimeout(() => {
-                notification.classList.remove('show');
-            }, 3000);
-        }
-        
-        // 页面加载完成后初始化
-        document.addEventListener('DOMContentLoaded', function() {
-            initEventListeners();
-            updateTreeCounts();
-            
-            // 添加一些初始树木用于演示（可选）
-            // 为了测试，您可以取消注释下面的代码，添加3棵小树苗
-            /*
-            setTimeout(() => {
-                for (let i = 0; i < 3; i++) {
-                    trees.push('seedling');
-                    seedlings++;
-                }
-                updateGarden();
-                updateTreeCounts();
-            }, 1000);
-            */
-            
-            // 显示初始提示
-            setTimeout(() => {
-                if (trees.length === 0) {
-                    showNotification('欢迎使用早读养小树！设置目标分贝后，点击"开始监测"按钮，大声朗读吧！', 'success');
-                }
-            }, 1000);
+
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            // 这三个处理会改变音量，测音量时必须全部关闭
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+            channelCount: 1
+          }
         });
-    </script>
+
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        // 移动端 / 自动播放策略下 AudioContext 可能是 suspended，
+        // 不 resume 的话 analyser 全是 0，界面永远不动
+        if (audioCtx.state === 'suspended') {
+          await audioCtx.resume();
+        }
+
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = FFT_SIZE;
+        analyser.smoothingTimeConstant = 0;   // 时域取数，平滑自己算更可控
+
+        audioCtx.createMediaStreamSource(stream).connect(analyser);
+        timeBuf = new Float32Array(analyser.fftSize);
+
+        stream.getAudioTracks().forEach(function (t) {
+          t.addEventListener('ended', onTrackEnded);
+        });
+
+        monitoring = true;
+        level = 0;
+        holdMs = 0;
+        quietMs = 0;
+        lastTick = 0;
+
+        setMonitoringUI(true);
+        currentDbDisplay.textContent = '0';
+        timerDisplay.textContent = '持续达标时间：0.0秒';
+
+        // 采样和渲染分开：采样用定时器（后台也能跑），渲染用 rAF（省性能）
+        sampleTimer = setInterval(sampleTick, SAMPLE_MS);
+        sampleTick();
+        rafId = requestAnimationFrame(renderLoop);
+
+        showNotification('已开始监测朗读声音，请大声朗读吧！', 'success');
+      } catch (err) {
+        console.error('无法访问麦克风:', err);
+        const messages = {
+          InsecureContextError: '当前页面不是 HTTPS，浏览器禁止使用麦克风',
+          NotAllowedError: '麦克风权限被拒绝，请在地址栏或系统设置中允许访问',
+          PermissionDeniedError: '麦克风权限被拒绝，请在地址栏或系统设置中允许访问',
+          NotFoundError: '没有检测到麦克风设备，请检查设备连接',
+          DevicesNotFoundError: '没有检测到麦克风设备，请检查设备连接',
+          NotReadableError: '麦克风被其他程序占用，请关闭后重试',
+          TrackStartError: '麦克风被其他程序占用，请关闭后重试',
+          OverconstrainedError: '麦克风不支持所需的音频参数'
+        };
+        const msg = messages[err.name] || ('无法访问麦克风（' + (err.name || '未知错误') + '）');
+        showNotification(msg, 'error');
+        setStatus(msg, '#f44336');
+        releaseMedia();
+        setMonitoringUI(false);
+      } finally {
+        starting = false;
+        startBtn.disabled = false;
+      }
+    }
+
+    function stopMonitoring() {
+      releaseMedia();
+      setMonitoringUI(false);
+      showNotification('已停止声音监测', 'warning');
+    }
+
+    // 释放所有音频资源（麦克风必须显式 stop，否则指示灯常亮）
+    function releaseMedia() {
+      monitoring = false;
+
+      if (sampleTimer) {
+        clearInterval(sampleTimer);
+        sampleTimer = null;
+      }
+      if (rafId) {
+        cancelAnimationFrame(rafId);
+        rafId = 0;
+      }
+      if (stream) {
+        stream.getTracks().forEach(function (t) {
+          t.removeEventListener('ended', onTrackEnded);
+          try { t.stop(); } catch (e) { /* ignore */ }
+        });
+        stream = null;
+      }
+      if (audioCtx) {
+        const ctx = audioCtx;
+        audioCtx = null;
+        if (ctx.state !== 'closed') {
+          ctx.close().catch(function () { /* ignore */ });
+        }
+      }
+
+      analyser = null;
+      timeBuf = null;
+      level = 0;
+      holdMs = 0;
+      quietMs = 0;
+      lastTick = 0;
+
+      currentDbDisplay.textContent = '--';
+      timerDisplay.textContent = '持续达标时间：0.0秒';
+    }
+
+    function onTrackEnded() {
+      if (!monitoring) return;
+      releaseMedia();
+      setMonitoringUI(false);
+      setStatus('麦克风已断开，监测已停止', '#f44336');
+      showNotification('麦克风连接已中断，请重新开始监测', 'error');
+    }
+
+    function setMonitoringUI(on) {
+      if (on) {
+        startBtn.innerHTML = '<i class="fas fa-microphone-slash"></i> 停止监测';
+        startBtn.classList.remove('btn-start');
+        startBtn.classList.add('btn-stop');
+        micStatus.classList.add('active');
+        setStatus('正在监测朗读声音...', '#388e3c');
+      } else {
+        startBtn.innerHTML = '<i class="fas fa-microphone"></i> 开始监测朗读声音';
+        startBtn.classList.remove('btn-stop');
+        startBtn.classList.add('btn-start');
+        micStatus.classList.remove('active');
+        setStatus('请允许麦克风访问并点击开始监测', '#546e7a');
+      }
+    }
+
+    /* ============================================================
+     * 采样：真正的音量计算 + 真实时间累计
+     * ============================================================ */
+    function sampleTick() {
+      if (!monitoring || !analyser) return;
+
+      analyser.getFloatTimeDomainData(timeBuf);
+
+      let sum = 0;
+      for (let i = 0; i < timeBuf.length; i++) {
+        const v = timeBuf[i];
+        sum += v * v;
+      }
+      const rms = Math.sqrt(sum / timeBuf.length);
+      const dbfs = 20 * Math.log10(rms || 1e-8);   // -Infinity ~ 0
+
+      // dBFS 是负数，映射到 0 以上的相对音量刻度，不设上限
+      // 安静房间约 5~12，正常朗读约 45~55，大声朗读约 90~100
+      let raw = (dbfs + DBFS_OFFSET) * DBFS_SCALE;
+      if (!isFinite(raw) || raw < 0) raw = 0;
+
+      // 上升快、回落慢：既不漏掉短促的爆发，也不会数字乱跳
+      const k = raw > level ? 0.55 : 0.12;
+      level = level + (raw - level) * k;
+
+      // 用真实时间差累计，而不是"数了几次 setInterval"
+      const now = performance.now();
+      if (!lastTick) lastTick = now;
+      let dt = now - lastTick;
+      lastTick = now;
+      if (dt > MAX_DT) dt = MAX_DT;
+      if (dt < 0) dt = 0;
+
+      // 标签页在后台时不累计，避免切走标签页白长树
+      if (document.hidden) {
+        holdMs = 0;
+        quietMs = 0;
+        return;
+      }
+
+      if (level >= targetDb) {
+        holdMs += dt;
+      } else {
+        holdMs = 0;
+      }
+
+      if (level < disappearDb) {
+        quietMs += dt;
+      } else {
+        quietMs = 0;
+      }
+
+      if (holdMs >= HOLD_MS) {
+        holdMs = 0;
+        addTree();
+      }
+      if (quietMs >= HOLD_MS) {
+        quietMs = 0;
+        removeTree();
+      }
+    }
+
+    /* ============================================================
+     * 渲染
+     * ============================================================ */
+    function renderLoop() {
+      if (!monitoring) return;
+      currentDbDisplay.textContent = Math.round(level);
+      updateStatusText();
+      timerDisplay.textContent = '持续达标时间：' + (holdMs / 1000).toFixed(1) + '秒';
+      rafId = requestAnimationFrame(renderLoop);
+    }
+
+    /* ============================================================
+     * 花园
+     * ============================================================ */
+    function count(type) {
+      let n = 0;
+      for (let i = 0; i < trees.length; i++) {
+        if (trees[i].type === type) n++;
+      }
+      return n;
+    }
+
+    function createTreeEl(type) {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'tree-container';
+
+      const treeElement = document.createElement('div');
+      treeElement.className = 'tree tree-' + type;
+
+      if (type === 'seedling') {
+        treeElement.innerHTML = '<div class="trunk"></div><div class="leaf"></div>';
+      } else if (type === 'small') {
+        treeElement.innerHTML =
+          '<div class="trunk"></div><div class="leaf-1"></div>' +
+          '<div class="leaf-2"></div><div class="leaf-3"></div>';
+      } else {
+        treeElement.innerHTML =
+          '<div class="trunk"></div><div class="leaf-1"></div>' +
+          '<div class="leaf-2"></div><div class="leaf-3"></div><div class="leaf-4"></div>';
+      }
+
+      const label = document.createElement('div');
+      label.className = 'tree-label';
+      label.textContent = type === 'seedling' ? '树苗' : (type === 'small' ? '小树' : '大树');
+
+      wrapper.appendChild(treeElement);
+      wrapper.appendChild(label);
+      return wrapper;
+    }
+
+    // 增量增删，不再整园重建（原来每加一棵树，整个花园都重新播放生长动画）
+    function addNode(type) {
+      const el = createTreeEl(type);
+      treesContainer.appendChild(el);
+      trees.push({ type: type, el: el });
+    }
+
+    function removeNode(type) {
+      for (let i = trees.length - 1; i >= 0; i--) {
+        if (trees[i].type === type) {
+          const el = trees[i].el;
+          trees.splice(i, 1);
+          el.classList.add('wither');
+          setTimeout(function () { el.remove(); }, 400);
+          return true;
+        }
+      }
+      return false;
+    }
+
+    function promoteAll() {
+      let merged = false;
+      let guard = 0;
+      while (guard++ < 100) {
+        if (count('seedling') >= 5) {
+          for (let i = 0; i < 5; i++) removeNode('seedling');
+          addNode('small');
+          merged = true;
+          showNotification('恭喜！5棵小树苗合成了一棵小树！', 'success');
+          continue;
+        }
+        if (count('small') >= 5) {
+          for (let i = 0; i < 5; i++) removeNode('small');
+          addNode('large');
+          merged = true;
+          showNotification('太棒了！5棵小树合成了一棵大树！', 'success');
+          continue;
+        }
+        break;
+      }
+      return merged;
+    }
+
+    function addTree() {
+      addNode('seedling');
+      const merged = promoteAll();
+      refreshStats();
+      if (!merged) {
+        showNotification('太棒了！你种下了一棵小树苗！', 'success');
+      }
+    }
+
+    function removeTree() {
+      if (trees.length === 0) return;
+
+      // 枯萎时按"底层优先"递减，拆分只给 4 个（5 合 1，拆回 5 会立刻重新合成，原来就是这个死循环）
+      if (count('seedling') > 0) {
+        removeNode('seedling');
+      } else if (count('small') > 0) {
+        removeNode('small');
+        for (let i = 0; i < 4; i++) addNode('seedling');
+      } else if (count('large') > 0) {
+        removeNode('large');
+        for (let i = 0; i < 4; i++) addNode('small');
+      }
+
+      refreshStats();
+      showNotification('声音太小了，一棵树枯萎了！请大声朗读！', 'error');
+    }
+
+    function refreshStats() {
+      const s = count('seedling');
+      const m = count('small');
+      const l = count('large');
+      seedlingCount.textContent = s;
+      smallTreeCount.textContent = m;
+      largeTreeCount.textContent = l;
+      totalTrees.textContent = s + m + l;
+      emptyGardenMessage.style.display = trees.length === 0 ? 'block' : 'none';
+    }
+
+    function resetGarden() {
+      for (let i = trees.length - 1; i >= 0; i--) {
+        trees[i].el.remove();
+      }
+      trees.length = 0;
+      holdMs = 0;
+      quietMs = 0;
+      refreshStats();
+      showNotification('花园已重置，重新开始朗读吧！', 'warning');
+    }
+
+    /* ============================================================
+     * 通知与事件
+     * ============================================================ */
+    function showNotification(message, type) {
+      notification.textContent = message;
+      notification.className = 'notification ' + type + ' show';
+      clearTimeout(showNotification.timer);
+      showNotification.timer = setTimeout(function () {
+        notification.classList.remove('show');
+      }, 3000);
+    }
+
+    function initEventListeners() {
+      targetDbSlider.addEventListener('input', function () {
+        targetDb = parseInt(this.value, 10);
+        clampThresholds('target');
+      });
+
+      disappearDbSlider.addEventListener('input', function () {
+        disappearDb = parseInt(this.value, 10);
+        clampThresholds('disappear');
+      });
+
+      startBtn.addEventListener('click', function () {
+        if (monitoring) {
+          stopMonitoring();
+        } else {
+          startMonitoring();
+        }
+      });
+
+      resetBtn.addEventListener('click', resetGarden);
+
+      // 离开页面时确保释放麦克风
+      window.addEventListener('pagehide', function () {
+        if (stream) {
+          releaseMedia();
+          setMonitoringUI(false);
+        }
+      });
+      document.addEventListener('visibilitychange', function () {
+        // 回到前台时重置计时基准，避免把后台时间算进去
+        if (!document.hidden) lastTick = 0;
+      });
+    }
+
+    document.addEventListener('DOMContentLoaded', function () {
+      loadSettings();
+      clampThresholds('init');
+      initEventListeners();
+      refreshStats();
+
+      setTimeout(function () {
+        if (trees.length === 0) {
+          showNotification('欢迎使用早读养小树！设置目标音量后，点击"开始监测"按钮，大声朗读吧！', 'success');
+        }
+      }, 1000);
+    });
+  })();
+</script>
 </body>
 </html>
